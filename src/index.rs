@@ -1,6 +1,8 @@
+use crate::types::{HashPrefix, HashPrefixRow};
 use anyhow::{Context, Result};
 use bitcoin::consensus::{deserialize, Decodable, Encodable};
 use bitcoin::hashes::Hash;
+use bitcoin::Script;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use bitcoin_slices::{bsl, Visit, Visitor};
 use std::ops::ControlFlow;
@@ -11,10 +13,7 @@ use crate::{
     db::{DBStore, WriteBatch},
     metrics::{self, Gauge, Histogram, Metrics},
     signals::ExitFlag,
-    types::{
-        bsl_txid, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow,
-        TxidRow,
-    },
+    types::{bsl_txid, HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow, TxidRow},
 };
 
 #[derive(Clone)]
@@ -212,7 +211,7 @@ impl Index {
         daemon.for_blocks(blockhashes, |blockhash, block| {
             let height = heights.next().expect("unexpected block");
             self.stats.observe_duration("block", || {
-                index_single_block(blockhash, block, height, &mut batch);
+                index_single_block(&self.store, blockhash, block, height, &mut batch);
             });
             self.stats.height.set("tip", height as f64);
         })?;
@@ -236,14 +235,40 @@ impl Index {
 }
 
 fn index_single_block(
+    store: &DBStore,
     block_hash: BlockHash,
     block: SerBlock,
     height: usize,
     batch: &mut WriteBatch,
 ) {
     struct IndexBlockVisitor<'a> {
+        store: &'a DBStore,
         batch: &'a mut WriteBatch,
         height: usize,
+        current_tx_index: usize,
+        current_input_index: usize,
+        current_witness: Vec<Vec<u8>>,
+    }
+
+    impl<'a> IndexBlockVisitor<'a> {
+        fn analyze_witness(
+            &self,
+            vin: usize,
+            witness: &[Vec<u8>],
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            // 实现隔离见证分析逻辑
+            // ...
+            Ok(())
+        }
+
+        fn analyze_non_standard(
+            &self,
+            tx_in: &bsl::TxIn,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            // 实现非标准脚本分析逻辑
+            // ...
+            Ok(())
+        }
     }
 
     impl<'a> Visitor for IndexBlockVisitor<'a> {
@@ -252,6 +277,10 @@ fn index_single_block(
             self.batch
                 .txid_rows
                 .push(TxidRow::row(txid, self.height).to_db_row());
+
+            self.current_tx_index += 1;
+            // 不需要在这里直接分析 witness，让回调方法处理
+            self.current_witness.clear();
             ControlFlow::Continue(())
         }
 
@@ -265,13 +294,16 @@ fn index_single_block(
             ControlFlow::Continue(())
         }
 
-        fn visit_tx_in(&mut self, _vin: usize, tx_in: &bsl::TxIn) -> ControlFlow<()> {
+        fn visit_tx_in(&mut self, vin: usize, tx_in: &bsl::TxIn) -> ControlFlow<()> {
             let prevout: OutPoint = tx_in.prevout().into();
             // skip indexing coinbase transactions' input
             if !prevout.is_null() {
                 let row = SpendingPrefixRow::row(prevout, self.height);
                 self.batch.spending_rows.push(row.to_db_row());
             }
+
+            self.current_input_index = vin;
+
             ControlFlow::Continue(())
         }
 
@@ -283,9 +315,44 @@ fn index_single_block(
                 .push(HeaderRow::new(header).to_db_row());
             ControlFlow::Continue(())
         }
+
+        fn visit_witness(&mut self, vin: usize) -> ControlFlow<()> {
+            self.current_witness.clear();
+            // 只有当我们在处理第一个输入时才继续分析
+            if self.current_input_index == 0 {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(()) // 跳过其他输入的 witness
+            }
+        }
+
+        fn visit_witness_element(&mut self, witness_i: usize, witness_element: &[u8]) {
+            self.current_witness.push(witness_element.to_vec());
+        }
+
+        fn visit_witness_end(&mut self) {
+            if !self.current_witness.is_empty() {
+                info!("分析交易 {} 的第一个输入的 witness", self.current_tx_index);
+                for (i, element) in self.current_witness.iter().enumerate() {
+                    info!("Witness 元素 {}: {:?}", i, element);
+                }
+                // 这里可以添加更详细的 witness 分析逻辑
+                match self.analyze_witness(self.current_input_index, &self.current_witness) {
+                    Ok(_) => info!("成功分析 witness"),
+                    Err(e) => info!("分析 witness 时出错: {:?}", e),
+                }
+            }
+        }
     }
 
-    let mut index_block = IndexBlockVisitor { batch, height };
+    let mut index_block = IndexBlockVisitor {
+        store,
+        batch,
+        height,
+        current_tx_index: 0,
+        current_input_index: 0,
+        current_witness: vec![],
+    };
     bsl::Block::visit(&block, &mut index_block).expect("core returned invalid block");
 
     let len = block_hash
